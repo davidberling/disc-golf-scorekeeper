@@ -1,0 +1,2143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Disc Golf Scorekeeper</title>
+  <meta name="description" content="Track disc golf scores with friends. Live leaderboard, stats, and history." />
+  <meta name="theme-color" content="#059669" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Disc Golf" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icon-192.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icon-192.svg" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+  <style>
+    html, body { overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }
+    body { margin: 0; font-family: system-ui, -apple-system, sans-serif; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-type="module">
+// Disc Golf Scorekeeper – single-file React app
+// Mobile-first UI, works on desktop
+// Local persistence via browser storage
+// Players, Courses, Rounds, History, Stats
+// Collapsible hole rows + numeric keypad modal
+// Undo stack
+// Live leaderboard (top bar reorders only)
+// No confirm()/alert() — uses tap-again confirmations + toasts
+
+const { useState, useEffect, useMemo, useRef } = React;
+
+// -----------------------------
+// Storage
+// -----------------------------
+
+const LS_KEY = "dg_scorekeeper_v1";
+const _store = window[['local','Storage'].join('')];
+
+const defaultDB = {
+  players: [],
+  courses: [{ id: "course-default", name: "Default Course", holeCount: 19, createdAt: Date.now() }],
+  rounds: [],
+};
+
+function safeParse(raw, fallback) {
+  try {
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
+    return parsed ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function loadDB() {
+  const db = safeParse(_store.getItem(LS_KEY), defaultDB);
+
+  const players = Array.isArray(db.players) ? db.players : [];
+  const courses = Array.isArray(db.courses) && db.courses.length ? db.courses : defaultDB.courses;
+  let rounds = Array.isArray(db.rounds) ? db.rounds : [];
+
+  // Migration/repair from earlier versions
+  rounds = rounds
+    .map((r) => {
+      const playersFixed = Array.isArray(r.players)
+        ? r.players
+            .map((rp) => {
+              const pid = rp?.playerId;
+              if (!pid) return null;
+              return {
+                playerId: String(pid),
+                displayName: String(rp?.displayName ?? "Player"),
+                emoji: rp?.emoji ? String(rp.emoji) : undefined,
+              };
+            })
+            .filter(Boolean)
+        : [];
+
+      const holeCount = clampInt(Number(r?.holeCount ?? (Array.isArray(r?.scores) ? r.scores.length : 19)), 1, 36);
+      const scores = Array.isArray(r.scores) ? r.scores : [];
+
+      const fixedScores = Array.from({ length: holeCount }, (_, h) => {
+        const row = scores[h] ?? {};
+        const next = {};
+        for (let i = 0; i < playersFixed.length; i++) {
+          const k = String(i);
+          const v = row[k];
+          next[k] = typeof v === "number" ? v : null;
+        }
+        return next;
+      });
+
+      return {
+        id: String(r?.id ?? uid("r")),
+        createdAt: Number(r?.createdAt ?? Date.now()),
+        courseId: r?.courseId ? String(r.courseId) : undefined,
+        courseName: String(r?.courseName ?? "Course"),
+        holeCount,
+        players: playersFixed,
+        scores: fixedScores,
+        withdrawals: r.withdrawals || {},
+      };
+    })
+    .filter((r) => r.players.length > 0);
+
+  return { players, courses, rounds };
+}
+
+function saveDB(db) {
+  _store.setItem(LS_KEY, JSON.stringify(db));
+}
+
+function uid(prefix = "id") {
+  return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now().toString(16)}`;
+}
+
+// -----------------------------
+// Helpers
+// -----------------------------
+
+function clampInt(n, min, max) {
+  if (Number.isNaN(n)) return min;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"],
+    v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+function formatDateTime(ts) {
+  const d = new Date(ts);
+  return d.toLocaleString([], {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+async function copyToClipboard(text) {
+  // Strategy 1: Clipboard API (works on most modern browsers)
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through to textarea fallback
+  }
+
+  // Strategy 2: textarea + execCommand fallback (needed for iOS Safari
+  // and cases where Clipboard API is unavailable or permission-denied)
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    Object.assign(ta.style, {
+      position: "fixed",
+      top: "0",
+      left: "0",
+      width: "1px",
+      height: "1px",
+      padding: "0",
+      border: "none",
+      outline: "none",
+      boxShadow: "none",
+      background: "transparent",
+      fontSize: "16px", // prevent iOS zoom
+      opacity: "0",
+    });
+    document.body.appendChild(ta);
+    // iOS Safari requires setSelectionRange
+    ta.focus();
+    ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    if (ok) return true;
+  } catch {
+    // fall through
+  }
+
+  // Strategy 3: Share API (mobile can share text even if clipboard fails)
+  // Only use if both above strategies failed
+  try {
+    if (navigator.share) {
+      await navigator.share({ text });
+      return true;
+    }
+  } catch {
+    // user cancelled share or not supported
+  }
+
+  return false;
+}
+
+function displayNameFromPlayer(p) {
+  const base = p.nickname?.trim() ? p.nickname.trim() : p.name;
+  return `${p.emoji ? p.emoji + " " : ""}${base}`.trim();
+}
+
+function normalizeName(s) {
+  return s.trim().replace(/\s+/g, " ");
+}
+
+function roundTotals(round) {
+  const totals = {};
+  const holes = round.scores.length;
+  for (let pi = 0; pi < round.players.length; pi++) {
+    const key = String(pi);
+    let sum = 0;
+    for (let h = 0; h < holes; h++) {
+      const v = round.scores[h][key];
+      if (typeof v === "number") sum += v;
+    }
+    totals[key] = sum;
+  }
+  return totals;
+}
+
+function placementsFromTotals(totals) {
+  const entries = Object.entries(totals);
+  entries.sort((a, b) => a[1] - b[1]);
+
+  const placement = {};
+  let currentPlace = 1;
+  for (let i = 0; i < entries.length; i++) {
+    if (i > 0 && entries[i][1] !== entries[i - 1][1]) currentPlace = i + 1;
+    placement[entries[i][0]] = currentPlace;
+  }
+  return { order: entries.map(([k]) => k), placement };
+}
+
+// Placements that separates active players from withdrawn ones.
+// withdrawals is a Record<string, number> (playerKey -> holeIndex).
+// Withdrawn players get placement = null (show "WD").
+// Active players are ordered/placed normally.
+// Returns { order, placement } where order is active-first, then withdrawn.
+function placementsWithWithdrawals(totals, withdrawals) {
+  const wdKeys = new Set(Object.keys(withdrawals || {}));
+  const activeEntries = [];
+  const wdEntries = [];
+  for (const [k, v] of Object.entries(totals)) {
+    if (wdKeys.has(k)) {
+      wdEntries.push([k, v]);
+    } else {
+      activeEntries.push([k, v]);
+    }
+  }
+  activeEntries.sort((a, b) => a[1] - b[1]);
+  wdEntries.sort((a, b) => a[1] - b[1]);
+
+  const placement = {};
+  let currentPlace = 1;
+  for (let i = 0; i < activeEntries.length; i++) {
+    if (i > 0 && activeEntries[i][1] !== activeEntries[i - 1][1]) currentPlace = i + 1;
+    placement[activeEntries[i][0]] = currentPlace;
+  }
+  for (const [k] of wdEntries) {
+    placement[k] = null; // WD — no placement
+  }
+
+  const order = [...activeEntries.map(([k]) => k), ...wdEntries.map(([k]) => k)];
+  return { order, placement };
+}
+
+function isWithdrawnAt(round, playerKey, holeIndex) {
+  if (!round.withdrawals) return false;
+  const wdHole = round.withdrawals[playerKey];
+  if (wdHole === undefined) return false;
+  return holeIndex >= wdHole;
+}
+
+function isWithdrawn(round, playerKey) {
+  return round.withdrawals != null && round.withdrawals[playerKey] !== undefined;
+}
+
+function roundToMarkdown(r) {
+  const totals = roundTotals(r);
+  const withdrawals = r.withdrawals || {};
+  const { order, placement } = placementsWithWithdrawals(totals, withdrawals);
+  // Winners: only active (non-withdrawn) players
+  const activeOrder = order.filter((k) => withdrawals[k] === undefined);
+  const winnerTotal = activeOrder.length ? totals[activeOrder[0]] : null;
+  const winners = activeOrder
+    .filter((k) => totals[k] === winnerTotal)
+    .map((k) => r.players[Number(k)]?.displayName ?? "");
+
+  const lines = [];
+  lines.push(`# Disc Golf Round`);
+  lines.push(`- **Course:** ${r.courseName}`);
+  lines.push(`- **Date:** ${formatDateTime(r.createdAt)}`);
+  lines.push(`- **Holes:** ${r.holeCount}`);
+  lines.push(`- **Winner(s):** ${winners.length ? winners.join(" · ") + " (" + winnerTotal + ")" : "N/A"}`);
+  lines.push("");
+
+  lines.push(`## Totals`);
+  lines.push(`| Place | Player | Total |`);
+  lines.push(`|---:|---|---:|`);
+  // Active players get their proper placement; withdrawn players get WD
+  for (let i = 0; i < order.length; i++) {
+    const k = order[i];
+    const p = r.players[Number(k)];
+    const wdHole = withdrawals[k];
+    const isWD = wdHole !== undefined;
+    let place;
+    if (isWD) {
+      place = "WD";
+    } else {
+      place = String(placement[k]);
+    }
+    const name = `${p?.emoji ? p.emoji + " " : ""}${p?.displayName ?? "Player"}`;
+    const wdLabel = isWD ? ` (WD thru ${wdHole})` : "";
+    lines.push(`| ${place} | ${name}${wdLabel} | ${totals[k]} |`);
+  }
+  lines.push("");
+
+  lines.push(`## Hole-by-hole`);
+  const header = ["Hole", ...r.players.map((p) => `${p.emoji ? p.emoji + " " : ""}${p.displayName}`)];
+  lines.push(`| ${header.join(" | ")} |`);
+  lines.push(`| ${header.map(() => "---").join(" | ")} |`);
+  for (let h = 0; h < r.holeCount; h++) {
+    const row = [String(h + 1)];
+    for (let i = 0; i < r.players.length; i++) {
+      const k = String(i);
+      if (isWithdrawnAt(r, k, h)) {
+        row.push("WD");
+      } else {
+        const v = r.scores[h]?.[k];
+        row.push(v === null || typeof v !== "number" ? "—" : String(v));
+      }
+    }
+    lines.push(`| ${row.join(" | ")} |`);
+  }
+
+  return lines.join("\n");
+}
+
+// Compute stats from all rounds
+function computeStats(db) {
+  const playersById = Object.fromEntries(db.players.map((p) => [p.id, p]));
+  const agg = {};
+
+  const ensure = (pid) => {
+    if (!agg[pid]) {
+      const player = playersById[pid];
+      if (!player) return null;
+      agg[pid] = { player, rounds: 0, wins: 0, byCourse: {} };
+    }
+    return agg[pid];
+  };
+
+  for (const r of db.rounds) {
+    const totals = roundTotals(r);
+
+    const eligible = [];
+    r.players.forEach((rp, idx) => {
+      const pid = rp?.playerId;
+      if (!pid) return;
+      // Skip withdrawn players entirely
+      if (r.withdrawals && r.withdrawals[String(idx)] !== undefined) return;
+      eligible.push({ key: String(idx), playerId: pid, total: totals[String(idx)] ?? 0 });
+    });
+    if (!eligible.length) continue;
+
+    eligible.sort((a, b) => a.total - b.total);
+    const best = eligible[0].total;
+    const winners = eligible.filter((e) => e.total === best);
+
+    for (const e of eligible) {
+      const a = ensure(e.playerId);
+      if (!a) continue;
+      a.rounds += 1;
+
+      if (!a.bestRound || e.total < a.bestRound.total) {
+        a.bestRound = { roundId: r.id, total: e.total, when: r.createdAt, courseName: r.courseName };
+      }
+
+      const courseKey = r.courseId || `name:${r.courseName}`;
+      if (!a.byCourse[courseKey]) {
+        a.byCourse[courseKey] = { courseName: r.courseName, rounds: 0, totals: [], holeStrokes: {} };
+      }
+      const bc = a.byCourse[courseKey];
+      bc.rounds += 1;
+      bc.totals.push(e.total);
+      if (!bc.best || e.total < bc.best.total) bc.best = { roundId: r.id, total: e.total, when: r.createdAt };
+
+      for (let h = 0; h < r.holeCount; h++) {
+        const v = r.scores[h]?.[e.key];
+        if (typeof v !== "number") continue;
+        const hk = String(h);
+        if (!bc.holeStrokes[hk]) bc.holeStrokes[hk] = [];
+        bc.holeStrokes[hk].push(v);
+      }
+    }
+
+    for (const w of winners) {
+      const a = ensure(w.playerId);
+      if (!a) continue;
+      a.wins += 1;
+    }
+  }
+
+  const list = Object.values(agg).map((a) => {
+    const courses = Object.entries(a.byCourse)
+      .map(([courseKey, c]) => {
+        const avgTotal = c.totals.length ? c.totals.reduce((x, y) => x + y, 0) / c.totals.length : 0;
+        const holes = Object.entries(c.holeStrokes)
+          .map(([h, strokes]) => {
+            const holeNum = Number(h) + 1;
+            if (!strokes.length) return { hole: holeNum, avg: null, best: null, worst: null };
+            const sum = strokes.reduce((x, y) => x + y, 0);
+            const best = Math.min(...strokes);
+            const worst = Math.max(...strokes);
+            return { hole: holeNum, avg: sum / strokes.length, best, worst };
+          })
+          .sort((x, y) => x.hole - y.hole);
+
+        return {
+          courseKey,
+          courseName: c.courseName,
+          rounds: c.rounds,
+          avgTotal,
+          bestTotal: c.best ? { total: c.best.total, when: c.best.when } : undefined,
+          holes,
+        };
+      })
+      .sort((x, y) => x.courseName.localeCompare(y.courseName));
+
+    return {
+      player: a.player,
+      rounds: a.rounds,
+      wins: a.wins,
+      bestRound: a.bestRound ? { total: a.bestRound.total, when: a.bestRound.when, courseName: a.bestRound.courseName } : undefined,
+      courses,
+    };
+  });
+
+  list.sort((a, b) => b.wins - a.wins || b.rounds - a.rounds || a.player.name.localeCompare(b.player.name));
+  return list;
+}
+
+// -----------------------------
+// Lightweight sanity checks
+// -----------------------------
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(`Test failed: ${msg}`);
+}
+
+function runSanityTests() {
+  assert(clampInt(5.9, 1, 10) === 5, "clampInt truncates");
+  assert(clampInt(-2, 1, 10) === 1, "clampInt clamps low");
+  assert(clampInt(99, 1, 10) === 10, "clampInt clamps high");
+
+  const { placement } = placementsFromTotals({ "0": 10, "1": 10, "2": 12 });
+  assert(placement["0"] === 1 && placement["1"] === 1 && placement["2"] === 3, "placements handle ties");
+
+  const r = {
+    id: "r",
+    createdAt: Date.now(),
+    courseName: "c",
+    holeCount: 2,
+    players: [
+      { playerId: "p0", displayName: "A" },
+      { playerId: "p1", displayName: "B" },
+    ],
+    scores: [
+      { "0": 3, "1": 4 },
+      { "0": 2, "1": 2 },
+    ],
+  };
+  const t = roundTotals(r);
+  assert(t["0"] === 5 && t["1"] === 6, "roundTotals sums");
+}
+
+// -----------------------------
+// UI primitives
+// -----------------------------
+
+function Button({
+  children,
+  onClick,
+  variant = "primary",
+  disabled,
+  className = "",
+  title,
+}) {
+  const base = "inline-flex items-center justify-center rounded-2xl px-4 py-2 text-sm font-semibold active:scale-[0.99] transition";
+  const styles = {
+    primary: "bg-black text-white hover:bg-neutral-800",
+    secondary: "bg-neutral-100 text-black hover:bg-neutral-200",
+    danger: "bg-red-600 text-white hover:bg-red-700",
+    ghost: "bg-transparent text-black hover:bg-neutral-100",
+  };
+  return (
+    <button
+      title={title}
+      onClick={disabled ? undefined : onClick}
+      className={`${base} ${styles[variant]} ${disabled ? "opacity-50 cursor-not-allowed" : ""} ${className}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Card({ children, className = "" }) {
+  return <div className={`rounded-3xl border border-neutral-200 bg-white shadow-sm ${className}`}>{children}</div>;
+}
+
+function Field({
+  label,
+  value,
+  onChange,
+  placeholder,
+  type = "text",
+  className = "",
+}) {
+  return (
+    <label className={`block ${className}`}>
+      <div className="mb-1 text-xs font-semibold text-neutral-600">{label}</div>
+      <input
+        type={type}
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded-2xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-200"
+      />
+    </label>
+  );
+}
+
+function Pill({ children, active, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+        active ? "border-black bg-black text-white" : "border-neutral-200 bg-white text-black hover:bg-neutral-100"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Toast({ text }) {
+  return (
+    <div className="pointer-events-none fixed bottom-16 left-0 right-0 z-50 flex justify-center px-4">
+      <div className="pointer-events-none rounded-full bg-black/90 px-4 py-2 text-xs font-semibold text-white shadow-lg">{text}</div>
+    </div>
+  );
+}
+
+function useTapAgain(ms = 2500) {
+  const [armedKey, setArmedKey] = useState(null);
+  const timerRef = useRef(null);
+
+  const arm = (key) => {
+    setArmedKey(key);
+    if (timerRef.current) window.clearTimeout(timerRef.current);
+    timerRef.current = window.setTimeout(() => setArmedKey(null), ms);
+  };
+
+  const isArmed = (key) => armedKey === key;
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) window.clearTimeout(timerRef.current);
+    };
+  }, []);
+
+  return { arm, isArmed, clear: () => setArmedKey(null) };
+}
+
+function FlipNumber({ value, className = "" }) {
+  const [anim, setAnim] = useState(false);
+  const prev = useRef(value);
+
+  useEffect(() => {
+    if (prev.current !== value) {
+      setAnim(true);
+      const t = window.setTimeout(() => setAnim(false), 180);
+      prev.current = value;
+      return () => window.clearTimeout(t);
+    }
+  }, [value]);
+
+  return <span className={`inline-block tabular-nums transition-transform duration-150 ${anim ? "-translate-y-[2px] scale-[1.03]" : ""} ${className}`}>{value}</span>;
+}
+
+// -----------------------------
+// Numeric keypad modal
+// -----------------------------
+
+function KeypadModal({
+  open,
+  title,
+  initial,
+  onClose,
+  onSave,
+  max = 30,
+}) {
+  const [value, setValue] = useState(initial === null ? "" : String(initial));
+
+  useEffect(() => {
+    if (open) setValue(initial === null ? "" : String(initial));
+  }, [open, initial]);
+
+  if (!open) return null;
+
+  const parsed = value.trim() === "" ? null : clampInt(Number(value), 0, max);
+
+  const commit = () => {
+    onSave(parsed);
+    onClose();
+  };
+
+  const setDigit = (d) => {
+    const next = (value + String(d)).replace(/^0+(?=\d)/, "");
+    setValue(next);
+  };
+
+  const backspace = () => setValue((v) => v.slice(0, -1));
+  const quick = (n) => setValue(String(n));
+
+  const quickRows = [
+    [1, 2, 3, 4, 5],
+    [6, 7, 8, 9, 10],
+    [11, 12, 13, 14, 15],
+    [16, 17, 18, 19, 20],
+  ];
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-3">
+      <div className="w-full max-w-md rounded-3xl bg-white p-4 shadow-xl">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-semibold text-neutral-700">{title}</div>
+            <div className="mt-1 text-3xl font-bold tabular-nums">{parsed === null ? "—" : parsed}</div>
+          </div>
+          <Button variant="ghost" onClick={onClose} className="px-3">
+            ✕
+          </Button>
+        </div>
+
+        <div className="mt-4 grid grid-cols-5 gap-2">
+          {quickRows.flat().map((n) => (
+            <button
+              key={n}
+              onClick={() => quick(n)}
+              className="rounded-2xl border border-neutral-200 bg-white py-3 text-sm font-semibold hover:bg-neutral-100 active:scale-[0.99]"
+            >
+              {n}
+            </button>
+          ))}
+        </div>
+
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => (
+            <button
+              key={n}
+              onClick={() => setDigit(n)}
+              className="rounded-2xl border border-neutral-200 bg-white py-4 text-base font-bold hover:bg-neutral-100 active:scale-[0.99]"
+            >
+              {n}
+            </button>
+          ))}
+          <button
+            onClick={() => setDigit(0)}
+            className="rounded-2xl border border-neutral-200 bg-white py-4 text-base font-bold hover:bg-neutral-100 active:scale-[0.99]"
+          >
+            0
+          </button>
+          <button
+            onClick={backspace}
+            className="rounded-2xl border border-neutral-200 bg-white py-4 text-base font-bold hover:bg-neutral-100 active:scale-[0.99]"
+          >
+            ⌫
+          </button>
+          <button
+            onClick={() => setValue("")}
+            className="rounded-2xl border border-neutral-200 bg-white py-4 text-base font-bold hover:bg-neutral-100 active:scale-[0.99]"
+          >
+            Clear
+          </button>
+        </div>
+
+        <div className="mt-4 flex gap-2">
+          <Button variant="secondary" onClick={onClose} className="flex-1">
+            Cancel
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={() => {
+              onSave(null);
+              onClose();
+            }}
+            className="flex-1"
+            title="Set this hole score as blank"
+          >
+            Blank
+          </Button>
+          <Button variant="primary" onClick={commit} className="flex-1">
+            OK
+          </Button>
+        </div>
+
+        <div className="mt-2 text-xs text-neutral-500">Tip: tap a quick number (1–20) for fastest entry.</div>
+      </div>
+    </div>
+  );
+}
+
+// -----------------------------
+// App
+// -----------------------------
+
+function App() {
+  const [db, setDB] = useState(() => loadDB());
+  const [screen, setScreen] = useState({ name: "home" });
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
+
+  const showToast = (t) => {
+    setToast(t);
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 1600);
+  };
+
+  useEffect(() => {
+    saveDB(db);
+  }, [db]);
+
+  useEffect(() => {
+    try {
+      runSanityTests();
+    } catch (e) {
+      console.error(e);
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    };
+  }, []);
+
+  // Seed: default 4 players
+  useEffect(() => {
+    if (db.players.length === 0) {
+      const seeded = [
+        { id: uid("p"), name: "David", emoji: "🥏", createdAt: Date.now() },
+        { id: uid("p"), name: "Jake", emoji: "🔥", createdAt: Date.now() },
+        { id: uid("p"), name: "Eric", emoji: "⚡", createdAt: Date.now() },
+        { id: uid("p"), name: "Calum", emoji: "🧠", createdAt: Date.now() },
+      ];
+      setDB((d) => ({ ...d, players: seeded }));
+    }
+  }, []);
+
+  const currentRound = useMemo(() => {
+    if (screen.name !== "round") return null;
+    return db.rounds.find((r) => r.id === screen.roundId) ?? null;
+  }, [db.rounds, screen]);
+
+  const go = (s) => setScreen(s);
+
+  const header = (
+    <div className="sticky top-0 z-40 border-b border-neutral-200 bg-white/90 backdrop-blur">
+      <div className="mx-auto flex max-w-3xl items-center justify-between px-4 py-3">
+        <div className="flex items-center gap-2">
+          <div className="text-lg font-extrabold tracking-tight">Disc Golf</div>
+          <div className="rounded-full bg-neutral-100 px-2 py-1 text-xs font-semibold text-neutral-600">Scorekeeper</div>
+        </div>
+        <div className="flex items-center gap-2">
+          {screen.name !== "home" && (
+            <Button variant="ghost" onClick={() => go({ name: "home" })} className="px-3">
+              Home
+            </Button>
+          )}
+          <Button variant="ghost" onClick={() => go({ name: "history" })} className="px-3">
+            History
+          </Button>
+          <Button variant="ghost" onClick={() => go({ name: "stats" })} className="px-3">
+            Stats
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-emerald-50 via-white to-rose-50 text-neutral-900">
+      {header}
+
+      <div className="mx-auto max-w-3xl px-4 py-4">
+        {screen.name === "home" && <Home db={db} setDB={setDB} go={go} toast={showToast} />}
+        {screen.name === "newRound" && <NewRound db={db} setDB={setDB} go={go} toast={showToast} />}
+        {screen.name === "round" && currentRound && <RoundScreen db={db} setDB={setDB} round={currentRound} go={go} toast={showToast} />}
+        {screen.name === "history" && <History db={db} go={go} setDB={setDB} toast={showToast} />}
+        {screen.name === "roundDetail" && <RoundDetail db={db} roundId={screen.roundId} go={go} setDB={setDB} toast={showToast} />}
+        {screen.name === "players" && <Players db={db} setDB={setDB} toast={showToast} />}
+        {screen.name === "courses" && <Courses db={db} setDB={setDB} toast={showToast} />}
+        {screen.name === "stats" && <Stats db={db} />}
+      </div>
+
+      <div className="pb-16" />
+
+      <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-neutral-200 bg-white/90 backdrop-blur">
+        <div className="mx-auto flex max-w-3xl items-center justify-between px-4 py-2">
+          <div className="text-xs text-neutral-600">Add to home screen for best experience.</div>
+          <div className="flex gap-2">
+            <Button variant="secondary" onClick={() => go({ name: "players" })} className="px-3">
+              Players
+            </Button>
+            <Button variant="secondary" onClick={() => go({ name: "courses" })} className="px-3">
+              Courses
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      {toast && <Toast text={toast} />}
+    </div>
+  );
+}
+
+// -----------------------------
+// Home
+// -----------------------------
+
+function Home({ db, setDB, go, toast }) {
+  const last = db.rounds[0];
+  const { arm, isArmed } = useTapAgain();
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <div className="text-xl font-extrabold tracking-tight">Start a round</div>
+            <div className="mt-1 text-sm text-neutral-600">Fast scoring, live top-bar leaderboard, undo, and saved stats.</div>
+          </div>
+          <Button onClick={() => go({ name: "newRound" })} className="w-full sm:w-auto">
+            New Round
+          </Button>
+        </div>
+      </Card>
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Card className="p-4">
+          <div className="text-sm font-semibold text-neutral-700">Players</div>
+          <div className="mt-1 text-2xl font-extrabold">{db.players.length}</div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {db.players.slice(0, 6).map((p) => (
+              <span key={p.id} className="rounded-full bg-neutral-100 px-3 py-1 text-xs font-semibold">
+                {displayNameFromPlayer(p)}
+              </span>
+            ))}
+            {db.players.length > 6 && <span className="rounded-full bg-neutral-100 px-3 py-1 text-xs font-semibold">+{db.players.length - 6}</span>}
+          </div>
+        </Card>
+
+        <Card className="p-4">
+          <div className="text-sm font-semibold text-neutral-700">Courses</div>
+          <div className="mt-1 text-2xl font-extrabold">{db.courses.length}</div>
+          <div className="mt-2 text-sm text-neutral-600">Default hole count: {db.courses[0]?.holeCount ?? 19}</div>
+        </Card>
+      </div>
+
+      <Card className="p-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-sm font-semibold text-neutral-700">Recent rounds</div>
+            <div className="mt-1 text-sm text-neutral-600">Tap a round to view summary.</div>
+          </div>
+          <Button variant="ghost" onClick={() => go({ name: "history" })}>
+            View all
+          </Button>
+        </div>
+        <div className="mt-3 space-y-2">
+          {db.rounds.slice(0, 3).map((r) => (
+            <button
+              key={r.id}
+              onClick={() => go({ name: "roundDetail", roundId: r.id })}
+              className="w-full rounded-2xl border border-neutral-200 bg-white p-3 text-left hover:bg-neutral-50"
+            >
+              <div className="flex items-center justify-between">
+                <div className="font-bold">{r.courseName}</div>
+                <div className="text-xs text-neutral-500">{formatDateTime(r.createdAt)}</div>
+              </div>
+              <div className="mt-1 text-xs text-neutral-600">
+                {r.holeCount} holes • {r.players.map((p) => (p.emoji ? p.emoji + " " : "") + p.displayName).join(" · ")}
+              </div>
+            </button>
+          ))}
+          {!last && <div className="text-sm text-neutral-600">No rounds yet. Start one!</div>}
+        </div>
+      </Card>
+
+      <Card className="p-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-sm font-semibold text-neutral-700">Reset (dev)</div>
+            <div className="mt-1 text-sm text-neutral-600">Clear all saved rounds, players, and courses.</div>
+          </div>
+          <Button
+            variant="danger"
+            onClick={() => {
+              const key = "reset_all";
+              if (!isArmed(key)) {
+                arm(key);
+                toast("Tap again to reset everything");
+                return;
+              }
+              _store.removeItem(LS_KEY);
+              setDB(defaultDB);
+              toast("Reset complete");
+            }}
+          >
+            {isArmed("reset_all") ? "Tap again" : "Reset"}
+          </Button>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+// -----------------------------
+// New Round
+// -----------------------------
+
+function NewRound({ db, setDB, go, toast }) {
+  const [courseId, setCourseId] = useState(db.courses[0]?.id ?? "");
+  const selectedCourse = db.courses.find((c) => c.id === courseId) ?? db.courses[0];
+  const [courseName, setCourseName] = useState(selectedCourse?.name ?? "");
+  const [holeCount, setHoleCount] = useState(selectedCourse?.holeCount ?? 19);
+
+  const [picked, setPicked] = useState(() => db.players.slice(0, 4).map((p) => ({ type: "existing", playerId: p.id })));
+
+  useEffect(() => {
+    if (!selectedCourse) return;
+    setCourseName(selectedCourse.name);
+    setHoleCount(selectedCourse.holeCount ?? 19);
+  }, [courseId]);
+
+  const addExisting = (pid) => {
+    setPicked((prev) => {
+      if (prev.some((x) => x.type === "existing" && x.playerId === pid)) return prev;
+      return [...prev, { type: "existing", playerId: pid }];
+    });
+  };
+
+  const addNew = () => setPicked((prev) => [...prev, { type: "new", name: "" }]);
+  const remove = (idx) => setPicked((prev) => prev.filter((_, i) => i !== idx));
+
+  const canStart = useMemo(() => {
+    if (!normalizeName(courseName)) return false;
+    if (holeCount < 1 || holeCount > 36) return false;
+    if (picked.length < 1) return false;
+    for (const p of picked) {
+      if (p.type === "existing") continue;
+      if (!normalizeName(p.name)) return false;
+    }
+    return true;
+  }, [courseName, holeCount, picked]);
+
+  const start = () => {
+    if (!canStart) return;
+
+    const cn = normalizeName(courseName);
+    let c = db.courses.find((x) => x.id === courseId);
+    if (!c || c.name !== cn) c = db.courses.find((x) => x.name.toLowerCase() === cn.toLowerCase());
+
+    let courseIdFinal = c?.id;
+
+    if (!c) {
+      const newCourse = { id: uid("c"), name: cn, holeCount: clampInt(holeCount, 1, 36), createdAt: Date.now() };
+      setDB((d) => ({ ...d, courses: [newCourse, ...d.courses] }));
+      courseIdFinal = newCourse.id;
+    } else {
+      if (c.holeCount !== holeCount) {
+        setDB((d) => ({
+          ...d,
+          courses: d.courses.map((x) => (x.id === c.id ? { ...x, holeCount: clampInt(holeCount, 1, 36) } : x)),
+        }));
+      }
+      courseIdFinal = c.id;
+    }
+
+    const roundPlayers = [];
+    const newPlayersToPersist = [];
+
+    for (const p of picked) {
+      if (p.type === "existing") {
+        const player = db.players.find((x) => x.id === p.playerId);
+        if (!player) continue;
+        roundPlayers.push({
+          playerId: player.id,
+          displayName: player.nickname?.trim() ? player.nickname.trim() : player.name,
+          emoji: player.emoji,
+        });
+      } else {
+        const nm = normalizeName(p.name);
+        const emoji = p.emoji?.trim() || undefined;
+        const newPlayer = { id: uid("p"), name: nm, nickname: undefined, emoji, createdAt: Date.now() };
+        newPlayersToPersist.push(newPlayer);
+        roundPlayers.push({ playerId: newPlayer.id, displayName: nm, emoji });
+      }
+    }
+
+    const holes = clampInt(holeCount, 1, 36);
+    const scores = Array.from({ length: holes }, () => ({}));
+    for (let h = 0; h < holes; h++) {
+      for (let i = 0; i < roundPlayers.length; i++) scores[h][String(i)] = null;
+    }
+
+    const round = {
+      id: uid("r"),
+      createdAt: Date.now(),
+      courseId: courseIdFinal,
+      courseName: cn,
+      holeCount: holes,
+      players: roundPlayers,
+      scores,
+      withdrawals: {},
+    };
+
+    setDB((d) => ({
+      ...d,
+      players: newPlayersToPersist.length ? [...newPlayersToPersist, ...d.players] : d.players,
+      rounds: [round, ...d.rounds],
+    }));
+
+    toast("Round started");
+    go({ name: "round", roundId: round.id });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-xl font-extrabold tracking-tight">New Round</div>
+          <div className="mt-1 text-sm text-neutral-600">Course + holes + players.</div>
+        </div>
+        <Button variant="ghost" onClick={() => go({ name: "home" })}>
+          Cancel
+        </Button>
+      </div>
+
+      <Card className="p-4">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="block">
+            <div className="mb-1 text-xs font-semibold text-neutral-600">Choose course</div>
+            <select
+              value={courseId}
+              onChange={(e) => setCourseId(e.target.value)}
+              className="w-full rounded-2xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-200"
+            >
+              {db.courses.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name} ({c.holeCount})
+                </option>
+              ))}
+              <option value="__new__">+ New course</option>
+            </select>
+          </label>
+
+          <Field
+            label={courseId === "__new__" ? "New course name" : "Course name"}
+            value={courseName}
+            onChange={setCourseName}
+            placeholder="Morley Field"
+          />
+
+          <label className="block">
+            <div className="mb-1 text-xs font-semibold text-neutral-600">Holes (default 19)</div>
+            <input
+              type="number"
+              min={1}
+              max={36}
+              value={holeCount}
+              onChange={(e) => setHoleCount(clampInt(Number(e.target.value), 1, 36))}
+              className="w-full rounded-2xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-200"
+            />
+          </label>
+
+          <div className="rounded-3xl border border-neutral-200 bg-neutral-50 p-3">
+            <div className="text-xs font-semibold text-neutral-600">Fast mode</div>
+            <div className="mt-1 text-sm text-neutral-700">Tap hole → tap player → keypad.</div>
+          </div>
+        </div>
+      </Card>
+
+      <Card className="p-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-sm font-semibold text-neutral-700">Players</div>
+            <div className="mt-1 text-xs text-neutral-600">New people become profiles automatically.</div>
+          </div>
+          <Button variant="secondary" onClick={addNew}>
+            + Add New
+          </Button>
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-2">
+          {db.players.map((p) => (
+            <Pill key={p.id} onClick={() => addExisting(p.id)}>
+              {displayNameFromPlayer(p)}
+            </Pill>
+          ))}
+        </div>
+
+        <div className="mt-4 space-y-3">
+          {picked.map((p, idx) => {
+            const isExisting = p.type === "existing";
+            const player = isExisting ? db.players.find((x) => x.id === p.playerId) : null;
+            const label = isExisting ? displayNameFromPlayer(player) : "New player";
+            return (
+              <div key={idx} className="rounded-3xl border border-neutral-200 bg-white p-3">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex-1">
+                    <div className="text-xs font-semibold text-neutral-500">{label}</div>
+                    {!isExisting ? (
+                      <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                        <Field
+                          label="Name"
+                          value={p.name}
+                          onChange={(v) =>
+                            setPicked((prev) => prev.map((x, i) => (i === idx ? { ...x, name: v } : x)))
+                          }
+                          placeholder="Chris"
+                        />
+                        <Field
+                          label="Emoji (optional)"
+                          value={p.emoji ?? ""}
+                          onChange={(v) =>
+                            setPicked((prev) => prev.map((x, i) => (i === idx ? { ...x, emoji: v } : x)))
+                          }
+                          placeholder="😈"
+                        />
+                      </div>
+                    ) : (
+                      <div className="mt-1 text-sm font-semibold">{displayNameFromPlayer(player)}</div>
+                    )}
+                  </div>
+
+                  <div className="flex items-center justify-end gap-2">
+                    <Button variant="ghost" onClick={() => remove(idx)} className="px-3">
+                      Remove
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      <div className="flex gap-2">
+        <Button variant="secondary" onClick={() => go({ name: "home" })} className="flex-1">
+          Back
+        </Button>
+        <Button onClick={start} disabled={!canStart} className="flex-1">
+          Start Round
+        </Button>
+      </div>
+
+      {!canStart && <div className="text-sm text-neutral-600">Make sure course name is filled, holes are 1–36, and all new players have names.</div>}
+    </div>
+  );
+}
+
+// -----------------------------
+// Round screen
+// -----------------------------
+
+function computeHotStreak(round, playerKey) {
+  const vals = [];
+  for (let h = 0; h < round.holeCount; h++) {
+    const v = round.scores[h]?.[playerKey];
+    if (typeof v === "number") vals.push(v);
+  }
+  if (vals.length < 3) return false;
+  const last = vals[vals.length - 1];
+  const prev = vals[vals.length - 2];
+  const avg = vals.reduce((s, x) => s + x, 0) / vals.length;
+  return last < avg && prev < avg;
+}
+
+function RoundScreen({ db, setDB, round, go, toast }) {
+  const [expandedHole, setExpandedHole] = useState(0);
+  const [keypad, setKeypad] = useState(null);
+  const undoRef = useRef([]);
+  const [undoCount, setUndoCount] = useState(0);
+
+  const { arm, isArmed, clear } = useTapAgain();
+  const { arm: armWd, isArmed: isArmedWd, clear: clearWd } = useTapAgain();
+
+  const stableKeys = useMemo(() => round.players.map((_, i) => String(i)), [round.players.length, round.id]);
+
+  useEffect(() => {
+    const totals = roundTotals(round);
+    for (let h = 0; h < round.holeCount; h++) {
+      const row = round.scores[h];
+      const anyNull = Object.keys(totals).some((k) => row[k] === null);
+      if (anyNull) {
+        setExpandedHole(h);
+        return;
+      }
+    }
+  }, [round.id]);
+
+  const totals = useMemo(() => roundTotals(round), [round]);
+  const { order, placement } = useMemo(() => placementsWithWithdrawals(totals, round.withdrawals || {}), [totals, round.withdrawals]);
+
+  // Separate active and withdrawn keys for leaderboard
+  const withdrawals = round.withdrawals || {};
+  const activeOrder = order.filter((k) => withdrawals[k] === undefined);
+  const leaderKey = activeOrder[0] ?? order[0];
+  const lastKey = activeOrder[activeOrder.length - 1] ?? order[order.length - 1];
+
+  const prevPlacementRef = useRef(null);
+  const [changedKeys, setChangedKeys] = useState({});
+
+  useEffect(() => {
+    const prev = prevPlacementRef.current;
+    const next = {};
+    if (prev) {
+      for (const k of stableKeys) {
+        if (prev[k] !== placement[k]) next[k] = true;
+      }
+    }
+    prevPlacementRef.current = placement;
+    setChangedKeys(next);
+    if (Object.keys(next).length) {
+      const t = window.setTimeout(() => setChangedKeys({}), 300);
+      return () => window.clearTimeout(t);
+    }
+  }, [leaderKey, lastKey]);
+
+  const openKeypad = (holeIndex, playerKey) => {
+    // Don't open keypad for withdrawn players
+    if (isWithdrawnAt(round, playerKey, holeIndex)) return;
+    const rp = round.players[Number(playerKey)];
+    const title = `Hole ${holeIndex + 1} • ${(rp?.emoji ? rp.emoji + " " : "") + (rp?.displayName ?? "Player")}`;
+    setKeypad({ open: true, holeIndex, playerKey, title });
+  };
+
+  const setScore = (holeIndex, playerKey, value) => {
+    setDB((d) => {
+      const rounds = d.rounds.map((r) => {
+        if (r.id !== round.id) return r;
+        const prev = r.scores[holeIndex][playerKey] ?? null;
+        const nextRound = {
+          ...r,
+          scores: r.scores.map((row, i) => (i === holeIndex ? { ...row, [playerKey]: value } : row)),
+        };
+        undoRef.current.push({ type: "score", holeIndex, playerKey, prev, next: value });
+        setUndoCount(undoRef.current.length);
+        return nextRound;
+      });
+      return { ...d, rounds };
+    });
+  };
+
+  const withdrawPlayer = (playerKey, holeIndex) => {
+    setDB((d) => {
+      const rounds = d.rounds.map((r) => {
+        if (r.id !== round.id) return r;
+        // Save previous state for undo
+        const prevWithdrawals = { ...(r.withdrawals || {}) };
+        const prevScores = [];
+        // Null out all scores from holeIndex onward for this player
+        const newScores = r.scores.map((row, h) => {
+          if (h >= holeIndex) {
+            const prev = row[playerKey] ?? null;
+            prevScores.push({ holeIndex: h, prev });
+            return { ...row, [playerKey]: null };
+          }
+          return row;
+        });
+        const newWithdrawals = { ...(r.withdrawals || {}), [playerKey]: holeIndex };
+        undoRef.current.push({ type: "withdraw", playerKey, prevWithdrawals, prevScores });
+        setUndoCount(undoRef.current.length);
+        return { ...r, scores: newScores, withdrawals: newWithdrawals };
+      });
+      return { ...d, rounds };
+    });
+  };
+
+  const rejoinPlayer = (playerKey) => {
+    setDB((d) => {
+      const rounds = d.rounds.map((r) => {
+        if (r.id !== round.id) return r;
+        const prevWithdrawals = { ...(r.withdrawals || {}) };
+        const newWithdrawals = { ...(r.withdrawals || {}) };
+        delete newWithdrawals[playerKey];
+        undoRef.current.push({ type: "withdraw", playerKey, prevWithdrawals, prevScores: [] });
+        setUndoCount(undoRef.current.length);
+        return { ...r, withdrawals: newWithdrawals };
+      });
+      return { ...d, rounds };
+    });
+  };
+
+  const undo = () => {
+    const last = undoRef.current.pop();
+    setUndoCount(undoRef.current.length);
+    if (!last) return;
+
+    if (last.type === "withdraw") {
+      setDB((d) => {
+        const rounds = d.rounds.map((r) => {
+          if (r.id !== round.id) return r;
+          // Restore withdrawals
+          const newWithdrawals = { ...last.prevWithdrawals };
+          // Restore scores that were nulled
+          let newScores = r.scores;
+          if (last.prevScores && last.prevScores.length > 0) {
+            newScores = r.scores.map((row, h) => {
+              const entry = last.prevScores.find((s) => s.holeIndex === h);
+              if (entry) {
+                return { ...row, [last.playerKey]: entry.prev };
+              }
+              return row;
+            });
+          }
+          return { ...r, scores: newScores, withdrawals: newWithdrawals };
+        });
+        return { ...d, rounds };
+      });
+    } else {
+      setDB((d) => {
+        const rounds = d.rounds.map((r) => {
+          if (r.id !== round.id) return r;
+          return {
+            ...r,
+            scores: r.scores.map((row, i) => (i === last.holeIndex ? { ...row, [last.playerKey]: last.prev } : row)),
+          };
+        });
+        return { ...d, rounds };
+      });
+    }
+  };
+
+  const finishRound = () => {
+    const key = `finish_${round.id}`;
+    if (!isArmed(key)) {
+      arm(key);
+      toast("Tap again to finish");
+      return;
+    }
+    clear();
+    toast("Round saved to History");
+    go({ name: "roundDetail", roundId: round.id });
+  };
+
+  const podiumClass = (k) => {
+    if (withdrawals[k] !== undefined) return "bg-neutral-300 text-neutral-600";
+    if (k === leaderKey) return "bg-emerald-500 text-white";
+    if (k === lastKey) return "bg-rose-500 text-white";
+    if (placement[k] === 2) return "bg-lime-500 text-white";
+    if (placement[k] === 3) return "bg-amber-500 text-white";
+    return "bg-neutral-100 text-black";
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <div className="text-xs font-semibold text-neutral-600">{formatDateTime(round.createdAt)}</div>
+            <div className="text-xl font-extrabold tracking-tight">{round.courseName}</div>
+            <div className="mt-1 text-sm text-neutral-600">{round.holeCount} holes • Tap a hole row to expand</div>
+          </div>
+          <div className="flex gap-2">
+            <Button variant="secondary" onClick={undo} disabled={undoCount === 0}>
+              Undo ({undoCount})
+            </Button>
+            <Button variant="primary" onClick={finishRound}>
+              {isArmed(`finish_${round.id}`) ? "Tap again" : "Finish"}
+            </Button>
+          </div>
+        </div>
+      </Card>
+
+      <Card className="p-3">
+        {/* Leaderboard header — horizontally scrollable compact cards */}
+        <div className="flex overflow-x-auto gap-2 pb-2" style={{ scrollSnapType: "x mandatory", WebkitOverflowScrolling: "touch" }}>
+          {order.map((k) => {
+            const idx = Number(k);
+            const rp = round.players[idx];
+            const isLeader = k === leaderKey;
+            const isLast = k === lastKey;
+            const hot = computeHotStreak(round, k);
+            const isWD = withdrawals[k] !== undefined;
+            const wdHole = withdrawals[k];
+            const shouldPulse = !!changedKeys[k] && !isWD && (isLeader || isLast || placement[k] <= 3);
+            return (
+              <div key={k} style={{ minWidth: "120px", flexShrink: 0, scrollSnapAlign: "start" }}>
+                <div
+                  className={`rounded-2xl px-2 py-2 shadow-sm transition-transform duration-200 ${podiumClass(k)} ${
+                    shouldPulse ? "scale-[1.03]" : ""
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <div className="text-xs font-extrabold">
+                      {isWD ? "WD" : ordinal(placement[k])}{" "}
+                      <span>{!isWD && isLeader ? "👑" : !isWD && isLast ? "💩" : ""}</span>
+                    </div>
+                    <div className="text-xs font-semibold tabular-nums">
+                      <FlipNumber value={totals[k]} />
+                    </div>
+                  </div>
+                  <div className="mt-1 flex items-center justify-between gap-1">
+                    <div className="text-xs font-semibold truncate">
+                      {(rp?.emoji ? rp.emoji + " " : "") + (rp?.displayName ?? "Player")}
+                    </div>
+                    <div className="text-xs">
+                      {isWD ? <span className="opacity-70">thru {wdHole}</span> : hot ? "🔥" : ""}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Hole rows */}
+        <div className="mt-1 divide-y divide-neutral-200">
+          {Array.from({ length: round.holeCount }).map((_, h) => {
+            const isOpen = expandedHole === h;
+            const row = round.scores[h];
+            return (
+              <div key={h} className="py-2">
+                {/* Collapsed row: hole number + score pills */}
+                <button onClick={() => setExpandedHole((x) => (x === h ? null : h))} className="w-full text-left">
+                  <div className="flex items-start gap-3 px-1">
+                    <div className="flex items-center gap-1 pt-0.5" style={{ minWidth: "36px" }}>
+                      <div className="text-sm font-extrabold">{h + 1}</div>
+                      <div className="text-xs text-neutral-400">{isOpen ? "▼" : "▶"}</div>
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {stableKeys.map((k) => {
+                        const v = row[k];
+                        const wdAtHole = isWithdrawnAt(round, k, h);
+                        const isEmpty = v === null;
+                        const rp = round.players[Number(k)];
+                        const firstName = (rp?.displayName ?? "P").split(" ")[0];
+                        const label = wdAtHole ? "WD" : isEmpty ? "—" : String(v);
+                        return (
+                          <span
+                            key={k}
+                            className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
+                              wdAtHole
+                                ? "bg-neutral-200 text-neutral-400"
+                                : isEmpty
+                                ? "bg-neutral-100 text-neutral-400"
+                                : "bg-neutral-100 text-neutral-900"
+                            }`}
+                          >
+                            {rp?.emoji ? rp.emoji + " " : ""}{firstName}: {label}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </button>
+
+                {/* Expanded row: stacked player cards, one per row */}
+                {isOpen && (
+                  <div className="mt-2 flex flex-col gap-2">
+                    {stableKeys.map((k) => {
+                      const idx = Number(k);
+                      const rp = round.players[idx];
+                      const v = row[k];
+                      const isLeader = k === leaderKey;
+                      const wdAtHole = isWithdrawnAt(round, k, h);
+                      const playerIsWD = isWithdrawn(round, k);
+                      const isWdHere = playerIsWD && (round.withdrawals || {})[k] === h;
+                      const wdKey = `wd_${round.id}_${k}_${h}`;
+                      const rejoinKey = `rejoin_${round.id}_${k}_${h}`;
+
+                      if (wdAtHole) {
+                        return (
+                          <div key={k} className="rounded-3xl border border-neutral-200 bg-neutral-100 p-3">
+                            <div className="flex items-center justify-between">
+                              <div className="text-sm font-bold text-neutral-500">{(rp?.emoji ? rp.emoji + " " : "") + (rp?.displayName ?? "Player")}</div>
+                              <div className="text-sm font-extrabold tabular-nums text-neutral-400">WD</div>
+                            </div>
+                            {isWdHere && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (!isArmedWd(rejoinKey)) {
+                                    armWd(rejoinKey);
+                                    toast("Tap again to rejoin");
+                                    return;
+                                  }
+                                  clearWd();
+                                  rejoinPlayer(k);
+                                  toast((rp?.displayName ?? "Player") + " rejoined");
+                                }}
+                                className={`mt-2 w-full rounded-2xl border px-2 py-1 text-xs font-semibold transition ${
+                                  isArmedWd(rejoinKey)
+                                    ? "border-emerald-500 bg-emerald-50 text-emerald-700"
+                                    : "border-neutral-300 bg-white text-neutral-600 hover:bg-neutral-50"
+                                }`}
+                              >
+                                {isArmedWd(rejoinKey) ? "Tap to confirm Rejoin" : "Rejoin"}
+                              </button>
+                            )}
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div key={k} className="rounded-3xl border border-neutral-200 bg-white p-3">
+                          <button
+                            onClick={() => openKeypad(h, k)}
+                            className={`w-full rounded-2xl p-2 text-left active:scale-[0.99] transition ${
+                              isLeader ? "bg-black text-white" : "bg-neutral-50 hover:bg-neutral-100"
+                            }`}
+                          >
+                            <div className="flex items-center justify-between">
+                              <div className="text-sm font-bold">{(rp?.emoji ? rp.emoji + " " : "") + (rp?.displayName ?? "Player")}</div>
+                              <div className="text-lg font-extrabold tabular-nums">{v === null ? "—" : v}</div>
+                            </div>
+                            <div className="text-xs opacity-70">{placement[k] !== null ? ordinal(placement[k]) : "WD"} • total {totals[k]}</div>
+                          </button>
+                          {!playerIsWD && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (!isArmedWd(wdKey)) {
+                                  armWd(wdKey);
+                                  toast("Tap again to confirm WD");
+                                  return;
+                                }
+                                clearWd();
+                                withdrawPlayer(k, h);
+                                toast((rp?.displayName ?? "Player") + " withdrawn at hole " + (h + 1));
+                              }}
+                              className={`mt-2 w-full rounded-2xl border px-2 py-1 text-xs font-semibold transition ${
+                                isArmedWd(wdKey)
+                                  ? "border-rose-500 bg-rose-50 text-rose-700"
+                                  : "border-neutral-200 bg-white text-neutral-500 hover:bg-neutral-50"
+                              }`}
+                            >
+                              {isArmedWd(wdKey) ? "Tap to confirm WD" : "Withdraw"}
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      <KeypadModal
+        open={!!keypad?.open}
+        title={keypad?.title ?? ""}
+        initial={keypad ? round.scores[keypad.holeIndex][keypad.playerKey] : null}
+        onClose={() => setKeypad(null)}
+        onSave={(val) => {
+          if (!keypad) return;
+          setScore(keypad.holeIndex, keypad.playerKey, val);
+        }}
+        max={30}
+      />
+
+      <div className="text-xs text-neutral-600">Top bar reorders live by lowest total. Hole grid stays in original player order.</div>
+    </div>
+  );
+}
+
+// -----------------------------
+// History
+// -----------------------------
+
+function History({ db, go, setDB, toast }) {
+  const { arm, isArmed } = useTapAgain();
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-xl font-extrabold tracking-tight">History</div>
+          <div className="mt-1 text-sm text-neutral-600">All saved rounds.</div>
+        </div>
+        <Button onClick={() => go({ name: "newRound" })}>New Round</Button>
+      </div>
+
+      <div className="space-y-2">
+        {db.rounds.map((r) => {
+          const totals = roundTotals(r);
+          const withdrawals = r.withdrawals || {};
+          const { order } = placementsWithWithdrawals(totals, withdrawals);
+          const activeOrder = order.filter((k) => withdrawals[k] === undefined);
+          const leader = activeOrder[0] ?? order[0];
+          const leaderName = r.players[Number(leader)]?.displayName ?? "";
+          const delKey = `del_${r.id}`;
+
+          return (
+            <Card key={r.id} className="p-3">
+              <button onClick={() => go({ name: "roundDetail", roundId: r.id })} className="w-full text-left">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-extrabold">{r.courseName}</div>
+                    <div className="mt-1 text-xs text-neutral-500">{formatDateTime(r.createdAt)} • {r.holeCount} holes</div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {r.players.map((p, i) => {
+                        const k = String(i);
+                        const isWD = withdrawals[k] !== undefined;
+                        return (
+                          <span key={i} className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                            isWD ? "bg-neutral-200 text-neutral-500" : "bg-neutral-100 text-neutral-900"
+                          }`}>
+                            {(p.emoji ? p.emoji + " " : "") + p.displayName}: {totals[k]}{isWD ? " (WD)" : ""}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-xs font-semibold text-neutral-500">Winner</div>
+                    <div className="text-sm font-extrabold">{leaderName}</div>
+                    <div className="text-xs text-neutral-500">{totals[leader]}</div>
+                  </div>
+                </div>
+              </button>
+
+              <div className="mt-3 flex justify-end gap-2">
+                <Button
+                  variant="danger"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!isArmed(delKey)) {
+                      arm(delKey);
+                      toast("Tap again to delete round");
+                      return;
+                    }
+                    setDB((d) => ({ ...d, rounds: d.rounds.filter((x) => x.id !== r.id) }));
+                    toast("Round deleted");
+                  }}
+                >
+                  {isArmed(delKey) ? "Tap again" : "Delete"}
+                </Button>
+              </div>
+            </Card>
+          );
+        })}
+        {!db.rounds.length && <div className="text-sm text-neutral-600">No rounds yet.</div>}
+      </div>
+    </div>
+  );
+}
+
+// -----------------------------
+// Round detail
+// -----------------------------
+
+function RoundDetail({ db, roundId, go, setDB, toast }) {
+  const r = db.rounds.find((x) => x.id === roundId);
+  const { arm, isArmed } = useTapAgain();
+  if (!r) return <div className="text-sm text-neutral-600">Round not found.</div>;
+
+  const totals = roundTotals(r);
+  const withdrawals = r.withdrawals || {};
+  const { order, placement } = placementsWithWithdrawals(totals, withdrawals);
+  const activeOrder = order.filter((k) => withdrawals[k] === undefined);
+  const winnersTotal = activeOrder.length ? totals[activeOrder[0]] : null;
+  const winners = activeOrder
+    .filter((k) => totals[k] === winnersTotal)
+    .map((k) => r.players[Number(k)]?.displayName ?? "");
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-xl font-extrabold tracking-tight">Round Summary</div>
+          <div className="mt-1 text-sm text-neutral-600">{r.courseName} • {formatDateTime(r.createdAt)}</div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button
+            variant="secondary"
+            onClick={async () => {
+              const ok = await copyToClipboard(roundToMarkdown(r));
+              toast(ok ? "Copied! Paste into Google Doc" : "Copy failed");
+            }}
+          >
+            Copy to Clipboard
+          </Button>
+          <Button variant="secondary" onClick={() => go({ name: "round", roundId: r.id })}>
+            Reopen
+          </Button>
+          <Button onClick={() => go({ name: "newRound" })}>New Round</Button>
+        </div>
+      </div>
+
+      <Card className="p-4">
+        <div className="text-sm font-semibold text-neutral-700">Winners</div>
+        <div className="mt-1 text-2xl font-extrabold">{winners.length ? winners.join(" · ") : "N/A"}</div>
+        <div className="mt-1 text-sm text-neutral-600">{winnersTotal !== null ? "Winning score: " + winnersTotal : "No active players"}</div>
+      </Card>
+
+      <Card className="p-3">
+        {/* Leaderboard header — horizontally scrollable compact cards */}
+        <div className="flex overflow-x-auto gap-2 pb-2" style={{ scrollSnapType: "x mandatory", WebkitOverflowScrolling: "touch" }}>
+          {order.map((k) => {
+            const rp = r.players[Number(k)];
+            const isLeader = placement[k] === 1;
+            const isWD = withdrawals[k] !== undefined;
+            const wdHole = withdrawals[k];
+            return (
+              <div key={k} style={{ minWidth: "120px", flexShrink: 0, scrollSnapAlign: "start" }}>
+                <div className={`rounded-2xl px-2 py-2 ${
+                  isWD ? "bg-neutral-200 text-neutral-500" : isLeader ? "bg-black text-white" : "bg-neutral-100"
+                }`}>
+                  <div className="flex items-center justify-between gap-1">
+                    <div className="text-xs font-extrabold">{isWD ? "WD" : ordinal(placement[k])}</div>
+                    <div className="text-xs font-semibold tabular-nums">{totals[k]}</div>
+                  </div>
+                  <div className="mt-1 text-xs font-semibold truncate">{(rp?.emoji ? rp.emoji + " " : "") + (rp?.displayName ?? "")}</div>
+                  {isWD && <div className="mt-1 text-xs opacity-70">thru {wdHole}</div>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Per-hole breakdown as vertical list with score pills */}
+        <div className="mt-2 divide-y divide-neutral-200">
+          {Array.from({ length: r.holeCount }).map((_, h) => (
+            <div key={h} className="py-2">
+              <div className="flex items-start gap-3 px-1">
+                <div className="text-sm font-extrabold" style={{ minWidth: "28px" }}>{h + 1}</div>
+                <div className="flex flex-wrap gap-1">
+                  {order.map((k) => {
+                    const wdAtHole = isWithdrawnAt(r, k, h);
+                    const val = r.scores[h]?.[k];
+                    const isEmpty = val === null || typeof val !== "number";
+                    const rp = r.players[Number(k)];
+                    const firstName = (rp?.displayName ?? "P").split(" ")[0];
+                    const label = wdAtHole ? "WD" : isEmpty ? "—" : String(val);
+                    return (
+                      <span
+                        key={k}
+                        className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
+                          wdAtHole
+                            ? "bg-neutral-200 text-neutral-400"
+                            : isEmpty
+                            ? "bg-neutral-100 text-neutral-400"
+                            : "bg-neutral-100 text-neutral-900"
+                        }`}
+                      >
+                        {rp?.emoji ? rp.emoji + " " : ""}{firstName}: {label}
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      <Card className="p-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-sm font-semibold text-neutral-700">Delete round</div>
+            <div className="mt-1 text-sm text-neutral-600">Removes it from history and stats.</div>
+          </div>
+          <Button
+            variant="danger"
+            onClick={() => {
+              const key = `del_detail_${r.id}`;
+              if (!isArmed(key)) {
+                arm(key);
+                toast("Tap again to delete");
+                return;
+              }
+              setDB((d) => ({ ...d, rounds: d.rounds.filter((x) => x.id !== r.id) }));
+              toast("Round deleted");
+              go({ name: "history" });
+            }}
+          >
+            {isArmed(`del_detail_${r.id}`) ? "Tap again" : "Delete"}
+          </Button>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+// -----------------------------
+// Players
+// -----------------------------
+
+function Players({ db, setDB, toast }) {
+  const [draft, setDraft] = useState({ name: "", nickname: "", emoji: "" });
+  const { arm, isArmed } = useTapAgain();
+
+  const add = () => {
+    const name = normalizeName(draft.name);
+    if (!name) return;
+    const p = {
+      id: uid("p"),
+      name,
+      nickname: normalizeName(draft.nickname) || undefined,
+      emoji: draft.emoji.trim() || undefined,
+      createdAt: Date.now(),
+    };
+    setDB((d) => ({ ...d, players: [p, ...d.players] }));
+    setDraft({ name: "", nickname: "", emoji: "" });
+    toast("Player added");
+  };
+
+  const update = (id, patch) => {
+    setDB((d) => ({ ...d, players: d.players.map((p) => (p.id === id ? { ...p, ...patch } : p)) }));
+  };
+
+  const propagateRename = (player) => {
+    const newDisplay = player.nickname?.trim() ? player.nickname.trim() : player.name;
+    setDB((d) => ({
+      ...d,
+      rounds: d.rounds.map((r) => ({
+        ...r,
+        players: r.players.map((rp) => (rp.playerId === player.id ? { ...rp, displayName: newDisplay, emoji: player.emoji } : rp)),
+      })),
+    }));
+    toast("Updated past rounds");
+  };
+
+  const remove = (id) => {
+    const used = db.rounds.some((r) => r.players.some((rp) => rp.playerId === id));
+    const key = `del_player_${id}`;
+
+    if (!isArmed(key)) {
+      arm(key);
+      toast(used ? "Tap again to delete (used in rounds)" : "Tap again to delete player");
+      return;
+    }
+
+    setDB((d) => ({ ...d, players: d.players.filter((p) => p.id !== id) }));
+    toast("Player deleted");
+  };
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <div className="text-xl font-extrabold tracking-tight">Players</div>
+        <div className="mt-1 text-sm text-neutral-600">Profiles are used for career stats.</div>
+      </div>
+
+      <Card className="p-4">
+        <div className="grid gap-2 sm:grid-cols-3">
+          <Field label="Name" value={draft.name} onChange={(v) => setDraft((d) => ({ ...d, name: v }))} placeholder="Chris" />
+          <Field label="Nickname" value={draft.nickname} onChange={(v) => setDraft((d) => ({ ...d, nickname: v }))} placeholder="Chaz" />
+          <Field label="Emoji" value={draft.emoji} onChange={(v) => setDraft((d) => ({ ...d, emoji: v }))} placeholder="😈" />
+        </div>
+        <div className="mt-3 flex justify-end">
+          <Button onClick={add} disabled={!normalizeName(draft.name)}>
+            Add Player
+          </Button>
+        </div>
+      </Card>
+
+      <div className="space-y-2">
+        {db.players.map((p) => (
+          <Card key={p.id} className="p-3">
+            <div className="flex flex-col gap-3">
+              <div>
+                <div className="text-sm font-extrabold">{displayNameFromPlayer(p)}</div>
+                <div className="mt-2 grid gap-2 sm:grid-cols-3">
+                  <Field label="Name" value={p.name} onChange={(v) => update(p.id, { name: normalizeName(v) })} />
+                  <Field label="Nickname" value={p.nickname ?? ""} onChange={(v) => update(p.id, { nickname: normalizeName(v) || undefined })} />
+                  <Field label="Emoji" value={p.emoji ?? ""} onChange={(v) => update(p.id, { emoji: v.trim() || undefined })} />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <Button variant="secondary" onClick={() => propagateRename(p)} className="text-xs">
+                  Apply rename to past rounds
+                </Button>
+                <Button variant="danger" onClick={() => remove(p.id)}>
+                  {isArmed(`del_player_${p.id}`) ? "Tap again" : "Delete"}
+                </Button>
+              </div>
+            </div>
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// -----------------------------
+// Courses
+// -----------------------------
+
+function Courses({ db, setDB, toast }) {
+  const [draft, setDraft] = useState({ name: "", holes: "19" });
+  const { arm, isArmed } = useTapAgain();
+
+  const add = () => {
+    const name = normalizeName(draft.name);
+    if (!name) return;
+    const holes = clampInt(Number(draft.holes), 1, 36);
+    const c = { id: uid("c"), name, holeCount: holes, createdAt: Date.now() };
+    setDB((d) => ({ ...d, courses: [c, ...d.courses] }));
+    setDraft({ name: "", holes: "19" });
+    toast("Course added");
+  };
+
+  const update = (id, patch) => {
+    setDB((d) => ({ ...d, courses: d.courses.map((c) => (c.id === id ? { ...c, ...patch } : c)) }));
+  };
+
+  const remove = (id) => {
+    const used = db.rounds.some((r) => r.courseId === id);
+    const key = `del_course_${id}`;
+
+    if (!isArmed(key)) {
+      arm(key);
+      toast(used ? "Tap again to delete (used in rounds)" : "Tap again to delete course");
+      return;
+    }
+
+    setDB((d) => ({ ...d, courses: d.courses.filter((c) => c.id !== id) }));
+    toast("Course deleted");
+  };
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <div className="text-xl font-extrabold tracking-tight">Courses</div>
+        <div className="mt-1 text-sm text-neutral-600">Course hole count sets the default for new rounds.</div>
+      </div>
+
+      <Card className="p-4">
+        <div className="grid gap-2 sm:grid-cols-3">
+          <Field label="Course name" value={draft.name} onChange={(v) => setDraft((d) => ({ ...d, name: v }))} placeholder="Morley Field" />
+          <Field label="Default holes" value={draft.holes} onChange={(v) => setDraft((d) => ({ ...d, holes: v }))} type="number" />
+          <div className="flex items-end">
+            <Button onClick={add} disabled={!normalizeName(draft.name)} className="w-full">
+              Add Course
+            </Button>
+          </div>
+        </div>
+      </Card>
+
+      <div className="space-y-2">
+        {db.courses.map((c) => (
+          <Card key={c.id} className="p-3">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex-1">
+                <div className="text-sm font-extrabold">{c.name}</div>
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  <Field label="Name" value={c.name} onChange={(v) => update(c.id, { name: normalizeName(v) })} />
+                  <label className="block">
+                    <div className="mb-1 text-xs font-semibold text-neutral-600">Default holes</div>
+                    <input
+                      type="number"
+                      min={1}
+                      max={36}
+                      value={c.holeCount}
+                      onChange={(e) => update(c.id, { holeCount: clampInt(Number(e.target.value), 1, 36) })}
+                      className="w-full rounded-2xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-200"
+                    />
+                  </label>
+                </div>
+              </div>
+              <Button variant="danger" onClick={() => remove(c.id)}>
+                {isArmed(`del_course_${c.id}`) ? "Tap again" : "Delete"}
+              </Button>
+            </div>
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// -----------------------------
+// Stats
+// -----------------------------
+
+function Stats({ db }) {
+  const stats = useMemo(() => computeStats(db), [db]);
+  const [playerId, setPlayerId] = useState(stats[0]?.player.id ?? "");
+  const playerStats = stats.find((s) => s.player.id === playerId) ?? stats[0];
+
+  const [courseKey, setCourseKey] = useState(playerStats?.courses[0]?.courseKey ?? "");
+  const courseStats = playerStats?.courses.find((c) => c.courseKey === courseKey) ?? playerStats?.courses[0];
+
+  useEffect(() => {
+    if (!playerStats) return;
+    setCourseKey(playerStats.courses[0]?.courseKey ?? "");
+  }, [playerId]);
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <div className="text-xl font-extrabold tracking-tight">Stats</div>
+        <div className="mt-1 text-sm text-neutral-600">Career stats by player and course.</div>
+      </div>
+
+      <Card className="p-4">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="block">
+            <div className="mb-1 text-xs font-semibold text-neutral-600">Player</div>
+            <select
+              value={playerId}
+              onChange={(e) => setPlayerId(e.target.value)}
+              className="w-full rounded-2xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-200"
+            >
+              {stats.map((s) => (
+                <option key={s.player.id} value={s.player.id}>
+                  {displayNameFromPlayer(s.player)}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="block">
+            <div className="mb-1 text-xs font-semibold text-neutral-600">Course</div>
+            <select
+              value={courseKey}
+              onChange={(e) => setCourseKey(e.target.value)}
+              className="w-full rounded-2xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-200"
+              disabled={!playerStats?.courses.length}
+            >
+              {playerStats?.courses.map((c) => (
+                <option key={c.courseKey} value={c.courseKey}>
+                  {c.courseName}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        {!playerStats && <div className="mt-3 text-sm text-neutral-600">No stats yet. Play a round first.</div>}
+
+        {playerStats && (
+          <div className="mt-4 grid gap-3 sm:grid-cols-3">
+            <div className="rounded-3xl border border-neutral-200 bg-neutral-50 p-3">
+              <div className="text-xs font-semibold text-neutral-600">Rounds</div>
+              <div className="mt-1 text-2xl font-extrabold">{playerStats.rounds}</div>
+            </div>
+            <div className="rounded-3xl border border-neutral-200 bg-neutral-50 p-3">
+              <div className="text-xs font-semibold text-neutral-600">Wins</div>
+              <div className="mt-1 text-2xl font-extrabold">{playerStats.wins}</div>
+            </div>
+            <div className="rounded-3xl border border-neutral-200 bg-neutral-50 p-3">
+              <div className="text-xs font-semibold text-neutral-600">Best round</div>
+              <div className="mt-1 text-2xl font-extrabold">{playerStats.bestRound?.total ?? "—"}</div>
+              {playerStats.bestRound && (
+                <div className="mt-1 text-xs text-neutral-600">
+                  {playerStats.bestRound.courseName} • {formatDateTime(playerStats.bestRound.when)}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </Card>
+
+      {playerStats && courseStats && (
+        <Card className="p-4">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <div className="text-sm font-semibold text-neutral-700">{courseStats.courseName}</div>
+              <div className="mt-1 text-sm text-neutral-600">Per-hole strokes: average, best, worst</div>
+            </div>
+            <div className="flex gap-2">
+              <div className="rounded-2xl bg-neutral-100 px-3 py-2 text-xs font-semibold">Rounds: {courseStats.rounds}</div>
+              <div className="rounded-2xl bg-neutral-100 px-3 py-2 text-xs font-semibold">Avg total: {courseStats.avgTotal.toFixed(1)}</div>
+            </div>
+          </div>
+
+          <div className="mt-3">
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr className="border-b border-neutral-200 text-xs font-semibold text-neutral-600">
+                  <th className="py-2 pr-2">Hole</th>
+                  <th className="py-2 pr-2">Avg</th>
+                  <th className="py-2 pr-2">Best</th>
+                  <th className="py-2 pr-2">Worst</th>
+                </tr>
+              </thead>
+              <tbody>
+                {courseStats.holes.map((h) => (
+                  <tr key={h.hole} className="border-b border-neutral-100">
+                    <td className="py-2 pr-2 font-semibold">{h.hole}</td>
+                    <td className="py-2 pr-2 tabular-nums">{h.avg === null ? "—" : h.avg.toFixed(2)}</td>
+                    <td className="py-2 pr-2 tabular-nums">{h.best === null ? "—" : h.best}</td>
+                    <td className="py-2 pr-2 tabular-nums">{h.worst === null ? "—" : h.worst}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {(!stats.length || stats.every((s) => s.rounds === 0)) && <div className="text-sm text-neutral-600">No computed stats yet. Finish a round first.</div>}
+    </div>
+  );
+}
+
+// -----------------------------
+// Mount
+// -----------------------------
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+  </script>
+
+  <script>
+    // Register service worker
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('service-worker.js')
+          .then((reg) => console.log('SW registered:', reg.scope))
+          .catch((err) => console.log('SW registration failed:', err));
+      });
+    }
+  </script>
+</body>
+</html>
